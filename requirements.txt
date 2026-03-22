@@ -1,0 +1,8 @@
+streamlit
+Pillow
+PyPDF2
+pandas
+openpyxl
+xlrd
+google-generativeai
+altair
