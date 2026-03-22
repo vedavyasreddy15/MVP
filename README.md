@@ -26,7 +26,7 @@ pip install -r requirements.txt
 ### 3. Run the App
 Start the Streamlit development server by running:
 ```bash
-streamlit run mvp_1.py
+streamlit run roster_mvp.py
 ```
 
 ## Deployment
