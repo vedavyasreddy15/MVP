@@ -32,7 +32,16 @@ def extract_text_with_gemini(api_key, uploaded_file):
     genai.configure(api_key=api_key.strip())
     file_type = uploaded_file.name.split('.')[-1].lower()
     
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # Dynamically select the newest 2.5 model first
+    available_models = [m.name for m in genai.list_models()]
+    if 'models/gemini-2.5-flash' in available_models:
+        model_name = 'gemini-2.5-flash'
+    elif 'models/gemini-2.0-flash' in available_models:
+        model_name = 'gemini-2.0-flash'
+    else:
+        model_name = 'gemini-1.5-flash-latest'
+        
+    model = genai.GenerativeModel(model_name)
     
     if file_type == 'pdf':
         reader = PyPDF2.PdfReader(uploaded_file)
@@ -91,30 +100,82 @@ st.sidebar.divider()
 # --- Database Loading ---
 st.sidebar.subheader("2. Load Database")
 db = {}
-octo_file = st.sidebar.file_uploader("Upload Octoparse File", type=["csv", "xlsx", "xls"])
 
-if octo_file:
-    try:
-        df = load_data(octo_file)
-        with st.sidebar.expander("📊 Preview Data"):
-            st.dataframe(df.head(5))
-            
-        columns = df.columns.tolist()
-        name_col = st.sidebar.selectbox("Player Names Column", options=columns, index=0)
+db_method = st.sidebar.radio("Input Method", ["Paste Text", "Upload File"], horizontal=True)
+
+if db_method == "Paste Text":
+    pasted_text = st.sidebar.text_area(
+        "Paste Player Data", 
+        height=200, 
+        placeholder="Paste directly from the IPL website or Excel!"
+    )
+    if pasted_text.strip():
+        clean_lines = [line.strip() for line in pasted_text.split('\n')]
+        clean_text = "\n".join(clean_lines)
         
-        num_cols = df.select_dtypes(include=['number']).columns.tolist()
-        default_pt_idx = columns.index(num_cols[0]) if num_cols else 0
-        point_col = st.sidebar.selectbox("Points Column", options=columns, index=default_pt_idx)
+        # 1. Try to match the official BCCI website copy-paste format (Name -> Team -> Points)
+        web_matches = re.findall(r'^([A-Za-z\s\-\'\.]+)\n([A-Z]{2,4})\n(\d+\.?\d*)', clean_text, re.MULTILINE)
+        
+        if web_matches:
+            for name_str, team_str, pt_str in web_matches:
+                name = name_str.strip().lower()
+                try:
+                    if name: db[name] = float(pt_str)
+                except ValueError:
+                    continue
+        else:
+            # 2. Fallback to standard line-by-line (Excel/Sheets format)
+            for line in clean_lines:
+                if not line: continue
+                
+                if '\t' in line:
+                    parts = line.split('\t')
+                    name_str, pt_str = parts[0], parts[-1]
+                else:
+                    match = re.search(r'^(.*?)\s+([-+]?\d*\.?\d+)\s*$', line)
+                    if match:
+                        name_str, pt_str = match.group(1), match.group(2)
+                    else:
+                        continue
+                
+                name = str(name_str).strip().lower()
+                if not re.search(r'[a-z]', name): # Ensure it's a name to avoid parsing bad rows
+                    continue
+                    
+                try:
+                    if name: db[name] = float(pt_str)
+                except ValueError:
+                    continue
+        
+        if db:
+            st.sidebar.success(f"✅ Loaded {len(db)} players from text.")
+        else:
+            st.sidebar.warning("⚠️ Could not read format. Ensure it is 'Name Points'.")
+else:
+    octo_file = st.sidebar.file_uploader("Upload Octoparse File", type=["csv", "xlsx", "xls"])
+    
+    if octo_file:
+        try:
+            df = load_data(octo_file)
+            with st.sidebar.expander("📊 Preview Data"):
+                st.dataframe(df.head(5))
+                
+            columns = df.columns.tolist()
+            name_col = st.sidebar.selectbox("Player Names Column", options=columns, index=0)
             
-        # Build dictionary cleanly
-        for _, row in df.iterrows():
-            try:
-                db[str(row[name_col]).lower().strip()] = float(row[point_col])
-            except (ValueError, TypeError):
-                continue
-        st.sidebar.success(f"✅ Loaded {len(db)} players.")
-    except Exception as e:
-        st.sidebar.error(f"Error loading data: {e}")
+            num_cols = df.select_dtypes(include=['number']).columns.tolist()
+            default_pt_idx = columns.index(num_cols[0]) if num_cols else 0
+            point_col = st.sidebar.selectbox("Points Column", options=columns, index=default_pt_idx)
+                
+            # Build dictionary cleanly
+            for _, row in df.iterrows():
+                try:
+                    db[str(row[name_col]).lower().strip()] = float(row[point_col])
+                except (ValueError, TypeError):
+                    continue
+            st.sidebar.success(f"✅ Loaded {len(db)} players.")
+        except Exception as e:
+            st.sidebar.error(f"Error loading data: {e}")
 
 # -----------------------------------------------------------------------------
 # MAIN DASHBOARD
@@ -130,6 +191,17 @@ if not db:
 num_teams = st.number_input("Number of Teams in Matchup", min_value=1, max_value=10, value=2, step=1)
 tabs = st.tabs([f"Team {i+1}" for i in range(num_teams)])
 team_scores = {}
+
+# Callbacks to safely update multiselect widgets without throwing Streamlit exceptions
+def clear_team_selection(t_key):
+    st.session_state[t_key]["selected_players"] = []
+    if f"multi_{t_key}" in st.session_state:
+        st.session_state[f"multi_{t_key}"] = []
+
+def reset_team_selection(t_key):
+    st.session_state[t_key]["selected_players"] = st.session_state[t_key]["extracted_players"].copy()
+    if f"multi_{t_key}" in st.session_state:
+        st.session_state[f"multi_{t_key}"] = st.session_state[t_key]["extracted_players"].copy()
 
 for i, tab in enumerate(tabs):
     with tab:
@@ -148,90 +220,127 @@ for i, tab in enumerate(tabs):
         state = st.session_state[team_key]
         
         # Header Row
-        col_name, col_upload = st.columns([1, 2])
+        col_name, col_input = st.columns([1, 2])
         with col_name:
             new_name = st.text_input(f"Team {i+1} Name", value=state["name"], key=f"name_{team_key}")
             state["name"] = new_name
-        with col_upload:
-            roster_file = st.file_uploader(f"Upload Roster Image/PDF", type=["pdf", "jpg", "jpeg", "png"], key=f"file_{team_key}")
+            
+            if st.button("🔄 Re-analyze Roster", key=f"reanalyze_{team_key}"):
+                state["processed_file"] = None
+                
+        with col_input:
+            input_method = st.radio("Roster Input Method", ["Upload File", "Paste Text"], key=f"method_{team_key}", horizontal=True)
+            
+            roster_file = None
+            roster_text = ""
+            current_input_id = None
+            
+            if input_method == "Upload File":
+                roster_file = st.file_uploader(f"Upload Roster Image/PDF", type=["pdf", "jpg", "jpeg", "png"], key=f"file_{team_key}")
+                if roster_file is not None:
+                    current_input_id = roster_file.name
+            else:
+                roster_text = st.text_area("Paste Roster Names", height=100, key=f"text_{team_key}", placeholder="Paste player names here...")
+                if roster_text.strip():
+                    current_input_id = hashlib.md5(roster_text.encode()).hexdigest()
         
         st.divider()
         
         # Process New Uploads
-        if roster_file is not None:
-            # Only process if it's a new file to save API calls
-            if roster_file.name != state["processed_file"]:
-                if not st.session_state.api_key_val:
-                    st.warning("⚠️ API Key required in sidebar for AI extraction.")
+        if current_input_id is not None:
+            if current_input_id != state["processed_file"]:
+                should_process = False
+                extracted_text = ""
+                
+                if input_method == "Upload File":
+                    if not st.session_state.api_key_val:
+                        st.warning("⚠️ API Key required in sidebar for AI extraction.")
+                    else:
+                        with st.spinner("🤖 AI is analyzing the roster..."):
+                            try:
+                                extracted_text = extract_text_with_gemini(st.session_state.api_key_val, roster_file)
+                                should_process = True
+                            except Exception as e:
+                                st.error(f"Extraction Failed: {e}")
                 else:
-                    with st.spinner("🤖 AI is analyzing the roster..."):
-                        try:
-                            extracted_text = extract_text_with_gemini(st.session_state.api_key_val, roster_file)
-                            state["raw_text"] = extracted_text
-                            state["processed_file"] = roster_file.name
+                    extracted_text = roster_text
+                    should_process = True
+                    
+                if should_process:
+                    state["raw_text"] = extracted_text
+                    state["processed_file"] = current_input_id
+                    
+                    # Matching Logic (Order-Preserving)
+                    search_text = extracted_text.lower()
+                    matched_with_idx = []
+                    
+                    # Sort players by length descending so we match full names before partials
+                    sorted_players = sorted(db.keys(), key=len, reverse=True)
+                    
+                    # 1. Exact Full Match
+                    for player in sorted_players:
+                        pattern = r'\b' + re.escape(player) + r'\b'
+                        for m in re.finditer(pattern, search_text):
+                            matched_with_idx.append((m.start(), player))
+                        search_text = re.sub(pattern, lambda x: ' ' * len(x.group()), search_text)
                             
-                            # Matching Logic
-                            search_text = extracted_text.lower()
-                            matched = []
-                            # 1. Full Match
-                            for player in db.keys():
-                                pattern = r'\b' + re.escape(player) + r'\b'
-                                if re.search(pattern, search_text):
-                                    matched.append(player)
-                                    search_text = re.sub(pattern, ' ', search_text)
-                            # 2. Surname Match
-                            for player in db.keys():
-                                if player in matched: continue
-                                parts = player.split()
-                                if len(parts) > 1 and len(parts[-1]) >= 3:
-                                    pattern = r'\b' + re.escape(parts[-1]) + r'\b'
-                                    if re.search(pattern, search_text):
-                                        matched.append(player)
-                                        search_text = re.sub(pattern, ' ', search_text)
-                            
-                            state["extracted_players"] = list(set(matched))
-                            state["selected_players"] = list(set(matched)) # Auto-select matches
-                            st.rerun() # Force UI update with new data
-                        except Exception as e:
-                            st.error(f"Extraction Failed: {e}")
+                    # 2. Surname Match
+                    for player in sorted_players:
+                        parts = player.split()
+                        if len(parts) > 1 and len(parts[-1]) >= 3:
+                            surname = parts[-1]
+                            pattern = r'\b' + re.escape(surname) + r'\b'
+                            for m in re.finditer(pattern, search_text):
+                                matched_with_idx.append((m.start(), player))
+                            search_text = re.sub(pattern, lambda x: ' ' * len(x.group()), search_text)
+                                
+                    matched_with_idx.sort(key=lambda x: x[0])
+                    
+                    matched = []
+                    for _, player in matched_with_idx:
+                        if player not in matched:
+                            matched.append(player)
+                    
+                    state["extracted_players"] = matched
+                    state["selected_players"] = matched.copy() # Auto-select matches
+                    st.session_state[f"multi_{team_key}"] = state["selected_players"].copy() # Fix: Visually update the dropdown!
+                    st.rerun() # Force UI update with new data
 
-        # Display Interface (Only if a file has been processed)
-        if state["processed_file"]:
-            col1, col2 = st.columns([1, 1])
+        # Display Interface (Always visible, even without uploading anything)
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.markdown(f"### {state['name']} Roster")
+            # Bind the multiselect to the session state so it doesn't clear
+            selected = st.multiselect(
+                "Verify / Edit Players",
+                options=list(db.keys()),
+                default=state["selected_players"],
+                key=f"multi_{team_key}",
+                format_func=lambda x: x.title()
+            )
+            # Update state if user manually changes selection
+            if selected != state["selected_players"]:
+                state["selected_players"] = selected
             
-            with col1:
-                st.markdown(f"### {state['name']} Roster")
-                # Bind the multiselect to the session state so it doesn't clear
-                selected = st.multiselect(
-                    "Verify / Edit Players",
-                    options=list(db.keys()),
-                    default=state["selected_players"],
-                    key=f"multi_{team_key}",
-                    format_func=lambda x: x.title()
-                )
-                # Update state if user manually changes selection
-                if selected != state["selected_players"]:
-                    state["selected_players"] = selected
-                
-                # Fast Clear/Reset buttons
-                c1, c2 = st.columns(2)
-                if c1.button("❌ Clear All", key=f"clear_{team_key}"):
-                    state["selected_players"] = []
-                    st.rerun()
-                if c2.button("🔄 Reset to AI Match", key=f"reset_{team_key}"):
-                    state["selected_players"] = state["extracted_players"].copy()
-                    st.rerun()
+            st.info(f"**Players Selected:** {len(state['selected_players'])}")
             
-            with col2:
-                # Calculate and display points
-                total_pts = sum(get_points(p, db) for p in state["selected_players"])
-                team_scores[state["name"]] = total_pts
-                
-                st.metric(label="Total Team Points", value=round(total_pts, 1))
-                
-                with st.expander("See Player Breakdown"):
-                    for p in state["selected_players"]:
-                        st.write(f"**{p.title()}**: {get_points(p, db)} pts")
+            # Fast Clear/Reset buttons
+            c1, c2 = st.columns(2)
+            c1.button("❌ Clear All", key=f"clear_{team_key}", on_click=clear_team_selection, args=(team_key,))
+            if state["processed_file"]:
+                c2.button("🔄 Reset to Match", key=f"reset_{team_key}", on_click=reset_team_selection, args=(team_key,))
+        
+        with col2:
+            # Calculate and display points
+            total_pts = sum(get_points(p, db) for p in state["selected_players"])
+            team_scores[state["name"]] = total_pts
+            
+            st.metric(label="Total Team Points", value=round(total_pts, 1))
+            
+            with st.expander("See Player Breakdown"):
+                for p in state["selected_players"]:
+                    st.write(f"**{p.title()}**: {get_points(p, db)} pts")
 
 # -----------------------------------------------------------------------------
 # LEADERBOARD SECTION
