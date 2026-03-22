@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Roster MVP 🏆 (IPL Fantasy Calculator)
 
 Welcome to **Roster MVP**! This Streamlit web application allows you to automatically extract player rosters from images or PDFs using Google's Gemini AI, match them against your custom database, and compare matchup scores across multiple teams.
