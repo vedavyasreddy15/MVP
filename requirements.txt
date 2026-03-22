@@ -1,18 +1,8 @@
-<<<<<<< HEAD
 streamlit
 Pillow
 PyPDF2
 pandas
 openpyxl
 xlrd
-google-generativeai
-=======
-streamlit
-Pillow
-PyPDF2
-pandas
-openpyxl
-xlrd
-google-generativeai
->>>>>>> 2c9c55d39ea6ad239611d228b267afda17e2f23b
+google-genai
 altair
